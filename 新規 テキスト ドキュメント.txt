@@ -1,0 +1,218 @@
+いいですね。要件そのままの**オンプレ×Windows前提**で、“各計算サーバーに`pricer.exe`（C:\pricer\）を置き、ユーザーが投げたファイルを各サーバーの`cache`に置いて実行→結果をクライアントに返す”構成を**C#だけで**作る最小実装を示します。
+
+# ざっくり構成
+
+* **Compute ノード（10台〜）**
+
+  * `C:\pricer\pricer.exe`（事前配置）
+  * `C:\cache\`（入力ファイル置き場）
+  * **NodeAgent（.NET 8 Minimal API）**：HTTPでファイルを受け取り、`cache`へ保存→`pricer.exe <inputPath>`を起動→完了したら**出力をHTTPレスポンスで返す**（stdout or 生成ファイル）
+* **クライアント**
+
+  * 投入ファイルを**任意の1台**へ送る（後述の簡易LB関数で台数増えてもOK）
+
+> “フォルダ監視”で`cache`を見張る方式も可能ですが、**HTTPで受けて即実行**の方が再送/タイムアウト/エラー返却がやりやすいです。
+
+---
+
+# ノード側：NodeAgent（サーバー常駐サービス）
+
+**前提**
+
+* OS: Windows
+* .NET 8
+* ポート例: `http://+:5080`（ファイアウォール許可）
+
+```csharp
+// NodeAgent/Program.cs  (.NET 8)
+using System.Diagnostics;
+using System.IO.Compression;
+using Microsoft.AspNetCore.Http.Features;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// 大きいファイルも受けられるように（必要に応じて調整）
+builder.Services.Configure<FormOptions>(o => { o.MultipartBodyLengthLimit = long.MaxValue; });
+var app = builder.Build();
+
+string PricerExe = @"C:\pricer\pricer.exe";  // 事前配置済み
+string CacheRoot = @"C:\cache";              // 事前に作成しておく
+Directory.CreateDirectory(CacheRoot);
+
+app.MapPost("/run", async (HttpRequest req, CancellationToken ct) =>
+{
+    // multipart/form-data:  file, optional: outputName
+    if (!req.HasFormContentType) return Results.BadRequest("multipart/form-data required");
+    var form = await req.ReadFormAsync(ct);
+    var file = form.Files["file"];
+    if (file is null || file.Length == 0) return Results.BadRequest("file missing");
+
+    // ジョブ用一時ディレクトリ
+    var jobId = Guid.NewGuid().ToString("N");
+    var jobDir = Path.Combine(CacheRoot, jobId);
+    Directory.CreateDirectory(jobDir);
+
+    var inputPath = Path.Combine(jobDir, file.FileName);
+    using (var fs = File.Create(inputPath)) { await file.CopyToAsync(fs, ct); }
+
+    // pricer.exe の引数は「入力ファイルのフルパス」想定
+    var psi = new ProcessStartInfo
+    {
+        FileName = PricerExe,
+        Arguments = $"\"{inputPath}\"",
+        WorkingDirectory = Path.GetDirectoryName(PricerExe)!,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        UseShellExecute = false,
+        CreateNoWindow = true
+    };
+
+    var proc = Process.Start(psi)!;
+    // 実行タイムアウト（必要なら延ばす）
+    var timeout = TimeSpan.FromMinutes(15);
+    if (!proc.WaitForExit((int)timeout.TotalMilliseconds))
+    {
+        try { proc.Kill(entireProcessTree: true); } catch {}
+        return Results.StatusCode(504); // Gateway Timeout 相当
+    }
+
+    var stdout = await proc.StandardOutput.ReadToEndAsync(ct);
+    var stderr = await proc.StandardError.ReadToEndAsync(ct);
+    var code = proc.ExitCode;
+
+    // 出力の扱い：
+    // 1) pricer.exe が標準出力を返す → それを返却
+    // 2) あるいは output ファイル群を生成する → zipに固めて返却
+    // 両対応にしておく
+    var outputs = Directory.GetFiles(jobDir)
+                           .Where(p => !p.Equals(inputPath, StringComparison.OrdinalIgnoreCase))
+                           .ToArray();
+
+    if (outputs.Length == 0 && code == 0 && !string.IsNullOrWhiteSpace(stdout))
+    {
+        // 標準出力が“結果”パターン
+        return Results.Text(stdout, "text/plain; charset=utf-8");
+    }
+    else
+    {
+        // ファイルをZIPにして返す（標準出力/標準エラーはメタとして含める）
+        var zipPath = Path.Combine(jobDir, "result.zip");
+        if (File.Exists(zipPath)) File.Delete(zipPath);
+        using (var zip = ZipFile.Open(zipPath, ZipArchiveMode.Create))
+        {
+            // 出力ファイル群
+            foreach (var p in outputs)
+                zip.CreateEntryFromFile(p, Path.GetFileName(p), CompressionLevel.Optimal);
+            // ログも同梱
+            File.WriteAllText(Path.Combine(jobDir, "stdout.txt"), stdout);
+            File.WriteAllText(Path.Combine(jobDir, "stderr.txt"), stderr);
+            zip.CreateEntryFromFile(Path.Combine(jobDir, "stdout.txt"), "stdout.txt");
+            zip.CreateEntryFromFile(Path.Combine(jobDir, "stderr.txt"), "stderr.txt");
+        }
+        var bytes = await File.ReadAllBytesAsync(zipPath, ct);
+        // 後始末はスケジューラで（下にメモ）
+        return Results.File(bytes, "application/zip", fileDownloadName: $"result-{jobId}.zip");
+    }
+})
+.WithName("RunPricer")
+.DisableAntiforgery();
+
+app.Run("http://0.0.0.0:5080");
+```
+
+**ポイント**
+
+* **`cache`に必ず保存**してから実行（要件合致）。
+* `stdout`が結果のケース／**生成ファイルをZIPで返す**ケースの両方に対応。
+* タイムアウト・エラーログ同梱でトラブルシュート容易。
+* ノードごとの**同時実行数**を制限したい場合は`SemaphoreSlim`でガード（例：同時4本など）。
+
+---
+
+# クライアント（最小）
+
+* ノードURLを配列に持ち、**ラウンドロビン or 最小負荷ノード**へ送るだけ。
+* 返ってきたものが`text/plain`ならそのまま、`application/zip`ならファイル保存。
+
+```csharp
+// Client.cs
+using System.Net.Http.Headers;
+
+var nodes = new[] {
+    "http://node01:5080", "http://node02:5080", /* … */ "http://node10:5080"
+};
+
+int rr = Environment.TickCount;
+string PickNode() => nodes[Math.Abs(++rr) % nodes.Length];
+
+async Task RunJobAsync(string inputPath)
+{
+    var node = PickNode();
+    using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(20) };
+
+    using var form = new MultipartFormDataContent();
+    var fileContent = new StreamContent(File.OpenRead(inputPath));
+    fileContent.Headers.ContentType = MediaTypeHeaderValue.Parse("application/octet-stream");
+    form.Add(fileContent, "file", Path.GetFileName(inputPath));
+
+    var res = await http.PostAsync($"{node}/run", form);
+    res.EnsureSuccessStatusCode();
+
+    var contentType = res.Content.Headers.ContentType?.MediaType ?? "";
+    if (contentType == "text/plain")
+    {
+        var text = await res.Content.ReadAsStringAsync();
+        Console.WriteLine("== RESULT (stdout) ==");
+        Console.WriteLine(text);
+    }
+    else if (contentType == "application/zip")
+    {
+        var bytes = await res.Content.ReadAsByteArrayAsync();
+        var save = Path.ChangeExtension(inputPath, $".result.{DateTime.UtcNow:yyyyMMddHHmmss}.zip");
+        await File.WriteAllBytesAsync(save, bytes);
+        Console.WriteLine($"ZIP saved: {save}");
+    }
+    else
+    {
+        var bytes = await res.Content.ReadAsByteArrayAsync();
+        var save = Path.ChangeExtension(inputPath, $".bin");
+        await File.WriteAllBytesAsync(save, bytes);
+        Console.WriteLine($"Binary saved: {save} ({contentType})");
+    }
+}
+```
+
+> もっと真面目にやるなら、**ヘルスチェック**で生存監視＆**同時実行数**をノードから取得して**最小負荷ノード選択**に。将来は中央の“オーケストレータ”（軽いAPI）を1つ置くのも◎。
+
+---
+
+# 運用メモ
+
+* **pricer.exe の出力仕様**
+
+  * 標準出力に結果を出す or 出力ファイルを生成するかをドキュメント化。上のAgentは両対応。
+* **権限**
+
+  * NodeAgentは`C:\pricer`実行権限・`C:\cache`書読み権限が必要。Windowsサービス化して常駐させるのが楽。
+* **後始末**
+
+  * `C:\cache\<jobId>` は日次で掃除（PowerShellやWindows タスクスケジューラで“7日より古いジョブDir削除”など）。
+* **並列数**
+
+  * `SemaphoreSlim(maxParallel)`で同時実行上限を設定し、CPU/RAMに合わせてチューニング。
+* **障害時**
+
+  * タイムアウトはHTTP 504相当。stderr/exit codeをZIPに含めるので原因が追いやすいです。
+
+---
+
+# さらに堅くするなら（あとから追加でOK）
+
+* **TLS/認証**（社内CAの証明書 + APIキー or mTLS）
+* **リトライ＆冪等**（クライアントがジョブIDで再送→同ジョブは再利用）
+* **キュー化**（即時実行ではなく、NodeAgent内に待ち行列を持たせる）
+* **結果の戻し先**（HTTP返却の代わりに、社内共有のNAS/DB/メッセージングへ）
+
+---
+
+必要なら、このNodeAgentを**Windowsサービス**にするインストール手順（`sc.exe create` or `nssm`）や、**最小の負荷分散オーケストレータ**のコードも用意します。どこまで作り込みますか？

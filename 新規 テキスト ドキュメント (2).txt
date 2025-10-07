@@ -1,0 +1,180 @@
+いいね、フェイルオーバーまで入れるなら「**落ちても別ノードで同じジョブをやり直せる**」「**中途半端に二重実行しても安全**」が肝。
+オーケストレータを増やさず、**今のHTTP直叩き構成のまま**で実装できる“最小のHA設計”→“発展形”の順で出します。
+
+---
+
+# 最小構成でのフェイルオーバー設計（追加分）
+
+## 1) ジョブID＋冪等
+
+* クライアントが **`jobId`** を発行（GUID）し、**どのノードに投げても同じID** を使う。
+* NodeAgent は `C:\cache\jobs\<jobId>\` をジョブ作業ディレクトリに固定。
+* **同じ`jobId`で再実行要求が来たら**
+
+  * すでに完了済み ⇒ **結果を即返す（キャッシュヒット）**
+  * 実行中 ⇒ **409/423** などで “実行中” を返す（クライアントは別ノードに切り替え or 後で再試行）
+  * 失敗/中断痕跡 ⇒ **安全に再実行**（一時ディレクトリをクリーンアップしてから再開）
+
+> これだけで “他ノードへ再送” が**二重実行になっても安全**になります。
+
+### NodeAgent 側（抜粋）
+
+```csharp
+app.MapPost("/run/{jobId}", async (string jobId, HttpRequest req, CancellationToken ct) =>
+{
+    var jobDir = Path.Combine(CacheRoot, "jobs", jobId);
+    var markerDone = Path.Combine(jobDir, ".done");
+    var markerRunning = Path.Combine(jobDir, ".running");
+
+    Directory.CreateDirectory(jobDir);
+
+    if (File.Exists(markerDone))
+    {
+        // 結果ZIPを返す（完了キャッシュ）
+        var zip = Path.Combine(jobDir, "result.zip");
+        return Results.File(zip, "application/zip", fileDownloadName: $"result-{jobId}.zip");
+    }
+    if (File.Exists(markerRunning))
+    {
+        return Results.StatusCode(StatusCodes.Status423Locked); // 実行中
+    }
+
+    // 入力ファイル受け取り
+    if (!req.HasFormContentType) return Results.BadRequest("multipart/form-data required");
+    var form = await req.ReadFormAsync(ct);
+    var file = form.Files["file"]; if (file is null) return Results.BadRequest("file missing");
+
+    var inputPath = Path.Combine(jobDir, file.FileName);
+    using (var fs = File.Create(inputPath)) { await file.CopyToAsync(fs, ct); }
+
+    // 実行中マーカー
+    await File.WriteAllTextAsync(markerRunning, DateTimeOffset.UtcNow.ToString("O"), ct);
+
+    try
+    {
+        var (code, zipPath) = await RunPricerAsync(inputPath, jobDir, ct);
+
+        if (code == 0)
+        {
+            await File.WriteAllTextAsync(markerDone, "ok", ct);
+            return Results.File(zipPath, "application/zip", fileDownloadName: $"result-{jobId}.zip");
+        }
+        else
+        {
+            return Results.Problem($"pricer exit code={code}", statusCode: 500);
+        }
+    }
+    finally
+    {
+        // ノードがクラッシュした場合は残るが、再実行時に上書き可
+        if (File.Exists(markerRunning)) File.Delete(markerRunning);
+    }
+});
+```
+
+## 2) ヘルスチェック＋同時実行スロット
+
+* NodeAgent に
+
+  * `GET /health`（200 = 生存）
+  * `GET /capacity`（`{ "running": 2, "limit": 4 }`）を追加。
+* クライアントは**空きスロットがあるノード**を優先選択。
+
+```csharp
+app.MapGet("/health", () => Results.Ok("ok"));
+app.MapGet("/capacity", () => Results.Json(new { running = RunningCount.Value, limit = MaxParallel }));
+```
+
+> `RunningCount` は `SemaphoreSlim` などで実行数を数えます。
+
+## 3) クライアント側：リトライ＆フェイルオーバー
+
+* ノード一覧を持ち、**ヘルスOK & 空きスロット多い順**に試行。
+* 失敗（タイムアウト/5xx/ネットワーク）なら**別ノードに即フェイルオーバー**。
+* ライブラリは Polly を使うと楽（例示は素の実装）。
+
+```csharp
+async Task<byte[]> RunWithFailoverAsync(string inputPath, string jobId)
+{
+    var nodes = await RankNodesAsync(); // /health と /capacity でソート
+    foreach (var node in nodes)
+    {
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(20) };
+            using var form = new MultipartFormDataContent();
+            var fileContent = new StreamContent(File.OpenRead(inputPath));
+            form.Add(fileContent, "file", Path.GetFileName(inputPath));
+
+            var res = await http.PostAsync($"{node}/run/{jobId}", form);
+            if ((int)res.StatusCode == 423) continue; // 実行中ノード。別ノードへ
+            res.EnsureSuccessStatusCode();
+
+            var ct = res.Content.Headers.ContentType?.MediaType ?? "";
+            if (ct == "application/zip") return await res.Content.ReadAsByteArrayAsync();
+            // 仕様次第でtext/plain対応 etc.
+            return await res.Content.ReadAsByteArrayAsync();
+        }
+        catch
+        {
+            // 通信失敗・タイムアウト → 次のノードへ
+            continue;
+        }
+    }
+    throw new Exception("全ノード到達不可（後で再試行してください）");
+}
+```
+
+> **重要**：`jobId` があるので“最初のノードが途中で落ちても”**次ノードで再実行**できます（冪等）。
+
+## 4) タイムアウト戦略
+
+* クライアント側 `Timeout` を設定（例：20分）。
+* NodeAgent も**子プロセスにタイムアウト**をかけ、超えたら kill。
+* いずれかでタイムアウトしたら**別ノードにリトライ**。
+
+## 5) 一時停止中/停止ノードの扱い
+
+* `health` が落ちたノードは**しばらく候補から外す**（簡易サーキットブレーカー：N秒間ブロック）。
+* フェイルバック（復帰）は `health` が安定して OK になったら再エントリー。
+
+---
+
+# さらに堅牢にする発展構成（必要に応じて）
+
+### A) “薄いディスパッチャ”を2台（Active-Active）
+
+* 役割：ノードの空きスロットを集約し、**どのノードに送るかだけ決めて**302でリダイレクト or 代理POST。
+* 2台を **keepalived / VRRP** などで**仮想IP**に載せる（片方落ちてももう片方が応答）。
+* 状態は持たず、**ノードの`/capacity`を見るだけ**なのでスプリットブレインに強い。
+
+### B) 共有のジョブレジストリ（Redis/SQL）
+
+* `jobId` の状態（queued/running/done/results-path）を**共有**し、どのノードでも参照可。
+* NodeAgent 起動時に**“見かけ上 実行中の古いjob”をエイジアウト**するスクリプトで掃除。
+* “どのノードで完了したか”に関わらず**結果取得API `/result/{jobId}`** でいつでもダウンロード。
+
+### C) 入力の二重化を減らす
+
+* クライアントがアップロードしたファイルを**最初はディスパッチャに置く**（NAS/MinIO等）。
+* NodeAgent は**そこからPull**して `cache` に展開 ⇒ ノードが落ちても**元の入力は残る**ので再配布が速い。
+
+---
+
+# 事故らないための“運用ガード”
+
+* **結果は必ずZIPに**（stdout・stderr・メタ情報含む）
+* **`jobId` + 入力のハッシュ** を `result.json` に保存（トレーサビリティ）
+* **ログの相関ID**＝`jobId` を全ログに含める（サーバー横断トラブルシュートが楽）
+* **NodeAgent の同時実行上限**を明示（CPU/RAMに合わせ調整）
+* **日次クリーンアップ**：`done` からX日後に掃除、`running` で古いものは中断扱いで削除
+
+---
+
+## まとめ
+
+* **必須**：`jobId` による冪等化／NodeAgentの`/health`と`/capacity`／クライアントのフェイルオーバー・リトライ。
+* **推奨**：結果キャッシュ（同`jobId`は即返し）、サーキットブレーカー、タイムアウト。
+* **拡張**：薄いディスパッチャ（2台, VIP）、共有レジストリ、入力の集中保管。
+
+「ディスパッチャ方式で行きたい」「まずはクライアント側リトライだけで始めたい」など方針を教えてくれれば、選んだ方式の**完成コード**（NodeAgent＋クライアント）をひとまとめで出します。

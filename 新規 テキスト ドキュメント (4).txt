@@ -1,0 +1,162 @@
+短答：**動きます。**
+ただし “同時大量”でも安定稼働させるには **バックプレッシャ** と **同時実行制御** をきちんと入れておくのがコツです。いまのHTTP方式のままで十分対応できます。
+
+---
+
+# まず押さえるべき設計ポイント
+
+1. **同時実行上限（NodeAgent）**
+
+* `pricer.exe` の同時起動数を `SemaphoreSlim` で制限（例：並列=CPUコア数）。
+* スロットが満杯なら **`429 Too Many Requests`**（または`503`）を返し、**`Retry-After`** を付ける。
+
+2. **キャパシティ可視化（/capacity）**
+
+* `running` / `limit` を返すエンドポイントを各Nodeに用意。
+* 親/グループリーダが**空きスロットがあるノードだけ**に配る（なければ429/503）。
+
+3. **アップロードは“ストリーミング→直書き”**
+
+* 受信したファイルは **逐次 `FileStream` に書く**（メモリに貯めない）。
+* `CopyToAsync` を使い、バッファは適切サイズ（例：128KB）。
+
+4. **冪等＆jobId**
+
+* 同じ `jobId` の再送は**同一結果を即返却**（二重実行を防ぐ）。
+* 失敗時やノード障害でも**別ノードでやり直せる**。
+
+5. **親/グループでのフェイルオーバー**
+
+* ヘルスと空きスロットを見て配布。失敗・タイムアウトなら**別ノード**へ。
+
+6. **業務的ガード**
+
+* **サイズ上限**・**拡張子/コンテンツ検証**・**同時アップロード件数**・**テナント毎レート制限**（トークンバケット）。
+* 長時間ジョブは**非同期API**（202 + `jobId`、後で`/result`取得）が安定。
+
+---
+
+# 具体コード（NodeAgent 抜粋：同時実行＆429）
+
+```csharp
+// グローバル
+static readonly SemaphoreSlim _slots = new(initialCount: Environment.ProcessorCount); // 同時実行数
+static int _running = 0;
+const int MaxInflightUploads = 8;                 // 受信中アップロードの並列上限
+static readonly SemaphoreSlim _rx = new(MaxInflightUploads);
+
+// /capacity で可視化
+app.MapGet("/capacity", () => Results.Json(new { running = _running, limit = Environment.ProcessorCount }));
+
+app.MapPost("/run/{jobId}", async (string jobId, HttpRequest req, CancellationToken ct) =>
+{
+    // 空きスロットがなければ即429
+    if (_slots.CurrentCount == 0)
+    {
+        var headers = new HeaderDictionary { ["Retry-After"] = "5" };
+        return Results.Problem("no slots", statusCode: 429, extensions: new() { ["retryAfter"] = 5 });
+    }
+
+    // アップロードの同時数も制限
+    if (!await _rx.WaitAsync(0, ct))
+    {
+        return Results.StatusCode(429);
+    }
+    try
+    {
+        if (!req.HasFormContentType) return Results.BadRequest("multipart/form-data required");
+        var form = await req.ReadFormAsync(ct);
+        var file = form.Files["file"]; if (file is null) return Results.BadRequest("file missing");
+
+        // 逐次ストリーミングで保存（メモリに載せない）
+        var jobDir = Path.Combine(CacheRoot, "jobs", jobId);
+        Directory.CreateDirectory(jobDir);
+        var inputPath = Path.Combine(jobDir, file.FileName);
+        using (var fs = new FileStream(
+            inputPath,
+            new FileStreamOptions { Access = FileAccess.Write, Mode = FileMode.Create, Options = FileOptions.Asynchronous | FileOptions.SequentialScan }))
+        using (var s = file.OpenReadStream()) // ここもストリームのまま
+        {
+            await s.CopyToAsync(fs, ct);
+        }
+
+        // 実行スロット確保（ここから実行）
+        await _slots.WaitAsync(ct);
+        Interlocked.Increment(ref _running);
+        try
+        {
+            // pricer.exe 実行 → 結果ZIP返却（前回答のRunPricerAsyncを呼ぶイメージ）
+            var (exitCode, zipPath) = await RunPricerAsync(inputPath, jobDir, ct);
+            if (exitCode != 0) return Results.StatusCode(500);
+            var bytes = await File.ReadAllBytesAsync(zipPath, ct);
+            return Results.File(bytes, "application/zip", fileDownloadName: $"result-{jobId}.zip");
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _running);
+            _slots.Release();
+        }
+    }
+    finally
+    {
+        _rx.Release();
+    }
+});
+```
+
+> これで **アップロードの同時数** と **実行の同時数** を別々に制御できます。
+> 満杯なら**素早く429**を返すので、親/グループ側が**他ノードへフェイルオーバー**しやすくなります。
+
+---
+
+# 親／グループ側の拡張（大量同時着弾時）
+
+* **ランク付け**：`/capacity` の `free = limit - running` が大きい順に送る。
+* **サーキットブレーカー**：429/5xx が続くノードは一定時間候補から外す。
+* **リトライ方針**：
+
+  * 429 は**すぐ別ノード**へ。
+  * タイムアウト/5xx は**指数バックオフ**付きで他ノードへ。
+* **キューイング（任意）**：どうしても全ノード満杯なら、親で**待ち行列**に入れて順次投入（非同期APIが前提）。
+
+---
+
+# Kestrel/インフラの設定ヒント
+
+* **Kestrel**
+
+  * `MaxRequestBodySize` を用途に合わせて（既定は30MB程度、必要なら拡張）。
+  * `MinimumRequestBodyDataRate` をゆるめに（低速回線対策）。
+  * HTTP/2 有効化（同時ストリームで多重化しやすい）。
+* **プロキシ**（Nginx/HAProxy）
+
+  * リクエストボディ上限、タイムアウト、アップロード用バッファの調整。
+  * mTLS / クライアント証明書で**社内限定**に。
+* **ファイルシステム**
+
+  * `C:\cache` は**SSD**。I/O競合を避けるためジョブごとサブフォルダ。
+  * 日次で**古いジョブの清掃**。
+* **レート制限（テナント別）**
+
+  * .NET 8 の `RateLimiter` ミドルウェアで**ユーザー/テナントKey**ごとに制御。
+
+---
+
+# どう使い分ける？
+
+* **“今すぐ返す” 同期API**：1～数分程度の処理、ピークでもノードにスロット余裕あり。
+* **非同期API（推奨・大規模向け）**：長時間処理や**大量同時投入**。
+
+  * `POST /submit -> 202 + jobId`
+  * `GET /status/{jobId}` / `GET /result/{jobId}`
+  * 親またはグループで**待ち行列**を持てるので、**一斉投入でも落ち着いて捌ける**。
+
+---
+
+## まとめ
+
+* **はい、同時多数投入でも動きます。**
+* そのために：**(1)ノードで同時実行＆受信を制限**、**(2)親/グループで空きスロットを見て配布**、**(3)満杯は429/Retry-Afterで素早く他ノードへ**。
+* 本格運用や長尺ジョブは**非同期API＋待ち行列**が鉄板です。
+
+必要なら、**親（非同期・キューあり）版の完全サンプル**もまとめます！

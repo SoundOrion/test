@@ -1,0 +1,214 @@
+いい質問！「待ち行列（キュー）」は**どの階層で持つか**と**どんな特性にするか**で設計が変わります。現構成（親→グループ→ノード）に合わせて、3段での実装パターンを示します。どれもC#だけでいけます。
+
+---
+
+# どこでキューを持つ？
+
+1. **ノード内キュー（最小構成・まずコレ）**
+
+   * 各 NodeAgent で**受信→キュー投入→ワーカーが取り出して実行**。
+   * メリット：シンプル。ノード単体で完結。
+   * デメリット：ノードが落ちるとキューも落ちる（→永続化や親側の再送でカバー）。
+
+2. **グループリーダ内キュー**
+
+   * グループ全体で**“入り口1箇所”**に貯め、空きノードに順次ディスパッチ。
+   * メリット：グループ内で負荷平準化・順番制御がしやすい。
+   * デメリット：リーダが単一障害点→冗長化（リース/HA）が必要。
+
+3. **親（コーディネータ）にグローバルキュー**
+
+   * すべてのジョブを親で蓄え、空きのあるグループへディスパッチ。
+   * メリット：全体最適・多段のバックプレッシャを集中管理。
+   * デメリット：実装が太る。冗長化が前提。
+
+> 小さく始めるなら **(1)ノード内** → 次に **(2)グループ** → 最後に **(3)親** の順で拡張が現実的。
+
+---
+
+# ノード内キュー：.NET 標準だけで堅く
+
+## A) Channel<T>（ロスしないメモリキュー＋バウンディング）
+
+```csharp
+// グローバル
+var queue = Channel.CreateBounded<Job>(new BoundedChannelOptions(capacity: 200) {
+    FullMode = BoundedChannelFullMode.Wait // 満杯なら待たせる（=バックプレッシャ）
+});
+
+// 受信側（HTTP/TCPハンドラ）
+app.MapPost("/submit/{jobId}", async (string jobId, IFormFile file, CancellationToken ct) =>
+{
+    // 入力を一旦ディスクへ（jobs/<jobId>/in.dat）
+    var job = await PersistInputAsync(jobId, file, ct);
+    // キュー投入（満杯なら待つか、すぐ429返す運用も可）
+    if (!await queue.Writer.WaitToWriteAsync(ct)) return Results.StatusCode(503);
+    await queue.Writer.WriteAsync(job, ct);
+    return Results.Accepted($"/status/{jobId}");
+});
+
+// ワーカー（固定並列 N 個）
+for (int i = 0; i < Environment.ProcessorCount; i++)
+{
+    _ = Task.Run(async () =>
+    {
+        while (await queue.Reader.WaitToReadAsync())
+        {
+            if (queue.Reader.TryRead(out var job))
+            {
+                await RunOneAsync(job); // pricer.exe 実行→結果保存
+            }
+        }
+    });
+}
+```
+
+### ポイント
+
+* **バウンデッド**なので溢れず、上流に**自然なバックプレッシャ**がかかる。
+* 満杯時の振る舞いを**Wait**（待つ）/**Drop**/**Latest**に切替可能。
+* メモリキューなので**プロセス再起動で消える**→入力は**受信時にディスク保存**しておくのがコツ。
+
+## B) 永続キュー（SQLite/LiteDBで数十行）
+
+* 受信時：`INSERT job(id, path, state='queued', priority, created_at)`
+* ワーカー：`SELECT ... WHERE state='queued' ORDER BY priority, created_at LIMIT 1 FOR UPDATE` → `state='running'` → 完了で `state='done'`
+* 落ちたら：起動時に `running` で古いものを `queued` に戻す（**可視性タイムアウト**的な復帰）。
+
+---
+
+# グループリーダ内キュー：順番・公平性・優先度
+
+## A) テナント別の**優先度キュー**（簡易版）
+
+```csharp
+// 優先度ごとにChannelを分け、ディスパッチャが比率制御で引き当て
+var high = Channel.CreateBounded<Job>(100);
+var normal = Channel.CreateBounded<Job>(300);
+var low = Channel.CreateBounded<Job>(200);
+
+async Task<Job?> DequeueAsync(CancellationToken ct)
+{
+    // 例：High:Normal:Low = 4:3:1 の重みで選ぶ
+    for (int i = 0; i < 4; i++) if (high.Reader.TryRead(out var j)) return j;
+    for (int i = 0; i < 3; i++) if (normal.Reader.TryRead(out var j)) return j;
+    if (low.Reader.TryRead(out var k)) return k;
+
+    // どれも無ければ待機
+    var tHigh = high.Reader.ReadAsync(ct).AsTask();
+    var tNormal = normal.Reader.ReadAsync(ct).AsTask();
+    var tLow = low.Reader.ReadAsync(ct).AsTask();
+    var done = await Task.WhenAny(tHigh, tNormal, tLow);
+    return done switch
+    {
+        _ when done == tHigh => tHigh.Result,
+        _ when done == tNormal => tNormal.Result,
+        _ => tLow.Result
+    };
+}
+```
+
+## B) **フェアネス**（テナントごとにラウンドロビン）
+
+* `Dictionary<TenantId, Channel<Job>>` を持ち、**ラウンドロビン**で各テナントの先頭を1件ずつ引く。
+* これで**一社だけが占有**するのを防げる。
+
+## C) **レート制限**（.NET 8 RateLimiter）
+
+* 受付時に `PartitionedRateLimiter<TenantId>` で**秒間/分間の最大受付数**を制御。
+* オーバーしたら**429 + Retry-After**で返す → 親が別グループへ回す。
+
+---
+
+# 親（グローバル）キュー：非同期API＋再試行
+
+## A) 受け口（非同期）
+
+```csharp
+// POST /submit -> 202 + jobId を返す（本体は後で取りに来る）
+app.MapPost("/submit/{jobId}", async (...) =>
+{
+    var job = await PersistInputAsync(...); // NAS/MinIOや共有ストレージ推奨
+    await EnqueueAsync(job);                // 親の永続キュー（SQLite/SQL/Redis）
+    return Results.Accepted($"/status/{job.Id}");
+});
+```
+
+## B) ディスパッチャ（バックグラウンド）
+
+```csharp
+// Queueから取り出し→空きのあるグループへsubmit
+while (true)
+{
+    var job = await DequeueNextAsync(ct); // state=queued を1件ロックして runningへ
+    var target = await PickGroupAsync();  // /capacity で空き最大のグループ
+    var ok = await TryDispatchAsync(target, job, ct);
+    if (!ok) { await RequeueWithBackoffAsync(job); } // 可視性タイムアウト/DLQ
+}
+```
+
+### 重要パターン：**可視性タイムアウト / DLQ**
+
+* 取り出したジョブに `lease_until = now + 5min` を付ける。
+* 期限内に完了報告が来なければ **再キュー**（重複実行OK前提＝冪等）。
+* リトライN回超で **Dead Letter Queue** へ送る（運用者が確認）。
+
+---
+
+# 「満杯」の伝え方と再投入（バックプレッシャ）
+
+* **Node**：実行スロット満杯 ⇒
+
+  * HTTPなら `429 Too Many Requests` + `Retry-After: 5`
+  * TCPなら `BUSY retry=5\n`
+* **Group/Parent**：そのノードを**一時的にスコア低下**（サーキットブレーカ）。空きができるノードに回す。
+* **全部満杯**：
+
+  * **非同期API**なら親/グループのキューで**待つ**。
+  * **同期API**なら 429/503 返却（クライアント側で後で再送 or 非同期へ切替推奨）。
+
+---
+
+# 状態遷移（おすすめのジョブ・ステートマシン）
+
+```
+queued -> leasing(running) -> done
+             |                 ^
+             | (timeout)       | (callback/完了通知)
+             v                 |
+          queued(backoff) -----+
+             |
+             +--> failed(retry_exhausted)  // DLQ
+```
+
+* **冪等キー**：`jobId` を主キーに、**結果の場所**（ファイルパス/URL）を保存。
+* **重複実行OK**：Node側は `jobId` ディレクトリ＋`.done` で**二重実行を自然に吸収**。
+
+---
+
+# 実装の部品集（C#）
+
+* **軽量・同プロセス**：`Channel<T>`, `SemaphoreSlim`, `RateLimiter`
+* **小規模永続**：`SQLite`（System.Data.SQLite）/ `LiteDB`
+* **中規模～**：Redis（StackExchange.Redis）で
+
+  * `List`/`Stream` + `SETNX`（重複防止）,
+  * `PEXPIRE`（可視性タイムアウト）,
+  * `ZSET`（遅延再投入/バックオフ）
+* **フル機能**：RabbitMQ/Kafka（オンプレOK）
+
+  * Rabbit：**優先度キュー**、DLX、遅延交換
+  * Kafka：**大スループット**、コンシューマグループ、DLT
+
+---
+
+# どれを選ぶ？
+
+* **まずは**：各ノードに `Channel<T>` で**バウンデッド・キュー**＋**非同期API**（202）
+* **拡張**：グループに**公平/優先度**を入れて平準化
+* **本格運用**：親に**永続キュー**・**可視性タイムアウト**・**DLQ**を入れる
+* **超大量**：RabbitMQ/Kafka を採用（既述のHTTP/TCPどちらでも併用可）
+
+---
+
+必要なら、**SQLite 永続キュー（親）＋ グループ平準化キュー（Channel）＋ ノード実行キュー（Channel）**までを一式つないだ**実働サンプル**をまとめます。どのレベル（ノード内／グループ／親）から作りますか？

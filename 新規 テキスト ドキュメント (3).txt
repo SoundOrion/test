@@ -1,0 +1,286 @@
+ありです。**親（コーディネータ）—子（グループリーダー）—ワーカー**の3層にすると、台数増えても配線がシンプルで、ラック/ネットワーク単位の障害にも強くできます。まずは**最小構成で動く**形→**フェイルオーバー**の入れ方→**サンプルコード**の順でまとめます。
+
+---
+
+# 目的と効果
+
+* **スケールアウト**：親は“どのグループに投げるか”だけ考えるので、総ノード数が増えても負荷一定。
+* **局所性**：グループ＝ラック/スイッチ/拠点単位にすると、**IO/ネットワーク局所化**。
+* **障害分離**：1グループが落ちても、他グループで処理継続。
+* **段階的HA**：最初は“親×1 + 各グループにリーダー×1”から、後で**親やリーダーの冗長化**を足せる。
+
+---
+
+# 最小アーキテクチャ（まずこれで動かす）
+
+```
+Client
+  │  (HTTP /submit)
+  ▼
+Parent (Coordinator API; stateless)
+  │  1) 全グループの「空き容量」「ヘルス」を保持
+  │  2) ジョブIDの一意性/冪等チェック
+  │  3) ベストなグループへフォワード
+  ▼
+Group Leader (per group; 小さなAPI)
+  │  ノード(子)の capacity を集約
+  │  ジョブを空きスロットがあるワーカーへ委譲
+  ▼
+NodeAgent (pricer.exe 実行; 既出のHTTPエージェント)
+```
+
+* **データの流れ**
+  Client → Parent（`/submit`）→ ある GroupLeader（`/dispatch`）→ NodeAgent（`/run/{jobId}`）
+* **戻り値**
+  最小構成では**同期実行**（ZIPやstdoutをそのままHTTPで返却）。計算時間が長い場合は**非同期（後述）**化。
+* **状態管理**
+
+  * `jobId` は **Client発行**で冪等。
+  * 親は**インメモリ or 軽量KV**（Redis/SQL）に `jobId → state/result-loc` を記録。
+  * GroupLeader は**各Nodeの“空きスロット/ヘルス”**を定期Pull（`/capacity`, `/health`）。
+
+---
+
+# フェイルオーバー（段階的に硬くする）
+
+**段階1：簡易FO（すぐ入れられる）**
+
+* Parentが`/dispatch`を投げて**5xx/タイムアウトなら別グループへ再送**。
+* GroupLeaderがNodeにフォワードして失敗したら**次のNodeへ**（フォールバック）。
+* どこで実行しても `jobId` が同じならOK（NodeAgentは既出の**冪等＆結果キャッシュ**実装）。
+
+**段階2：親の冗長化**
+
+* Parentを**2台**起動し、**VIP（keepalived/VRRP）**やL4LBでトラフィック分散。
+* Parentは**ステートレス＋Redis/SQL**に状態を書き、どちらに来ても同じ判断ができる。
+
+**段階3：グループリーダーの冗長化**
+
+* グループに**Leader候補を2台**。
+* **リーダー選出**は Redis の**分散ロック（SET NX PX）**または SQL の**リース行**で実装（数十行で可）。
+* フォロワーはリース切れを検知して昇格。Parentは**“今のLeaderのURL”をRedis/SQLから取得**。
+
+**段階4：非同期化（長時間ジョブ）**
+
+* Parent `/submit` は **202 Accepted + jobId** を返す。
+* Client は `/result/{jobId}` で後から取得。
+* GroupLeader は**進捗・完了通知**を Redis/SQL に書く（またはWebSocket/SSEでPush）。
+
+---
+
+# ルーティングの方針（どのグループ/どのノードへ？）
+
+* **グループ選定**：
+
+  1. **Least-Loaded**：`freeSlots = limit - running` が最大のグループ。
+  2. **Topology-Aware**（推奨）：クライアント拠点＝近いグループを優先し、同点ならLeast-Loaded。
+  3. **Hash-Based**（同一系データは同じグループへ）：“同じ銘柄/顧客/日付は同グループ”でキャッシュ効率UP。
+
+* **ノード選定（グループ内部）**：
+  **Least-Loaded** or **Weighted-RoundRobin** + **ヘルス**（`/health` NGなら除外）。
+
+---
+
+# コード骨子（C# / .NET 8）
+
+### 1) 親（Coordinator API; stateless）
+
+```csharp
+// Parent/Program.cs  (最小: 同期実行で結果をそのまま返す版)
+using Microsoft.AspNetCore.Mvc;
+using System.Net.Http.Headers;
+using System.Text.Json;
+
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddHttpClient();
+builder.Services.AddSingleton<GroupDirectory>(); // グループのエンドポイント/状態
+var app = builder.Build();
+
+app.MapPost("/submit/{jobId}", async ([FromRoute] string jobId, HttpRequest req, IHttpClientFactory f, GroupDirectory dir, CancellationToken ct) =>
+{
+    if (!req.HasFormContentType) return Results.BadRequest("multipart/form-data required");
+    var form = await req.ReadFormAsync(ct);
+    var file = form.Files["file"]; if (file is null) return Results.BadRequest("file missing");
+
+    // 1) グループ一覧からヘルス&空きスロットを取得
+    var groups = await dir.GetRankedGroupsAsync(ct); // 空き多い順
+    // 2) いい感じのグループへフォワード（失敗したら順にフォールバック）
+    foreach (var g in groups)
+    {
+        try
+        {
+            using var http = f.CreateClient();
+            using var content = new MultipartFormDataContent();
+            var sc = new StreamContent(file.OpenReadStream());
+            sc.Headers.ContentType = MediaTypeHeaderValue.Parse("application/octet-stream");
+            content.Add(sc, "file", file.FileName);
+
+            var res = await http.PostAsync($"{g.LeaderBaseUrl}/dispatch/{jobId}", content, ct);
+            if (res.IsSuccessStatusCode)
+            {
+                var bytes = await res.Content.ReadAsByteArrayAsync(ct);
+                var media = res.Content.Headers.ContentType?.MediaType ?? "application/octet-stream";
+                var name = res.Content.Headers.ContentDisposition?.FileNameStar ?? $"result-{jobId}";
+                return Results.File(bytes, media, name);
+            }
+        }
+        catch { /* try next group */ }
+    }
+    return Results.StatusCode(503); // 全グループNG
+});
+
+app.Run("http://0.0.0.0:5000");
+
+// ---- ランキング用の超ミニ実装例 ----
+record GroupInfo(string Name, string LeaderBaseUrl);
+class GroupDirectory
+{
+    // 設定ファイル/DBに持っておく
+    private readonly List<GroupInfo> _groups = new() {
+        new("g1","http://g1-leader:5081"), new("g2","http://g2-leader:5081")
+    };
+
+    public async Task<List<(GroupInfo g,int free)>> GetRankedGroupsAsync(CancellationToken ct)
+    {
+        var list = new List<(GroupInfo,int)>();
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+        foreach (var g in _groups)
+        {
+            try
+            {
+                var j = await http.GetStringAsync($"{g.LeaderBaseUrl}/capacity", ct);
+                var cap = JsonSerializer.Deserialize<Cap>(j)!;
+                list.Add((g, cap.limit - cap.running));
+            }
+            catch { /* ヘルスNG扱い */ }
+        }
+        return list
+            .Where(x => x.Item2 > 0)
+            .OrderByDescending(x => x.Item2)
+            .Select(x => (x.g, x.Item2))
+            .ToList();
+    }
+    record Cap(int running, int limit);
+}
+```
+
+### 2) グループリーダー（GroupLeader; 各グループ1つ）
+
+```csharp
+// GroupLeader/Program.cs
+using Microsoft.AspNetCore.Mvc;
+using System.Net.Http.Headers;
+using System.Text.Json;
+
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddHttpClient();
+var app = builder.Build();
+
+var nodes = new[]
+{
+    "http://node-a:5080",
+    "http://node-b:5080",
+    "http://node-c:5080",
+};
+
+app.MapGet("/capacity", async () =>
+{
+    // グループ全体の running/limit 合計
+    int running = 0, limit = 0;
+    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+    foreach (var n in nodes)
+    {
+        try
+        {
+            var j = await http.GetStringAsync($"{n}/capacity");
+            var c = JsonSerializer.Deserialize<Cap>(j)!;
+            running += c.running; limit += c.limit;
+        }
+        catch { /* 落ちてるノードは無視 */ }
+    }
+    return Results.Json(new { running, limit });
+});
+
+app.MapPost("/dispatch/{jobId}", async ([FromRoute] string jobId, HttpRequest req, IHttpClientFactory f, CancellationToken ct) =>
+{
+    if (!req.HasFormContentType) return Results.BadRequest();
+    var form = await req.ReadFormAsync(ct);
+    var file = form.Files["file"]; if (file is null) return Results.BadRequest("file missing");
+
+    // ノードの capacity を見て “空き最大”へ
+    var ranked = await RankNodesAsync(nodes, ct);
+    foreach (var node in ranked)
+    {
+        try
+        {
+            using var http = f.CreateClient();
+            using var content = new MultipartFormDataContent();
+            var sc = new StreamContent(file.OpenReadStream());
+            sc.Headers.ContentType = MediaTypeHeaderValue.Parse("application/octet-stream");
+            content.Add(sc, "file", file.FileName);
+
+            var res = await http.PostAsync($"{node}/run/{jobId}", content, ct);
+            if ((int)res.StatusCode == 423) continue; // そのノードでは同job実行中
+            if (res.IsSuccessStatusCode)
+            {
+                var bytes = await res.Content.ReadAsByteArrayAsync(ct);
+                var media = res.Content.Headers.ContentType?.MediaType ?? "application/octet-stream";
+                var name = res.Content.Headers.ContentDisposition?.FileNameStar ?? $"result-{jobId}";
+                return Results.File(bytes, media, name);
+            }
+        }
+        catch { /* 次ノードへ */ }
+    }
+    return Results.StatusCode(503);
+});
+
+app.Run("http://0.0.0.0:5081");
+
+static async Task<List<string>> RankNodesAsync(string[] nodes, CancellationToken ct)
+{
+    var list = new List<(string node,int free)>();
+    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+    foreach (var n in nodes)
+    {
+        try
+        {
+            var j = await http.GetStringAsync($"{n}/capacity", ct);
+            var c = JsonSerializer.Deserialize<Cap>(j)!;
+            list.Add((n, c.limit - c.running));
+        }
+        catch { /* ヘルスNG */ }
+    }
+    return list.Where(x => x.free > 0).OrderByDescending(x => x.free).Select(x => x.node).ToList();
+}
+record Cap(int running, int limit);
+```
+
+### 3) 子ノード（NodeAgent; 既出の実装に少し追加）
+
+* 既出コードに **`/capacity`** と **同時実行ガード（SemaphoreSlim）** を入れてください。
+* 既出の `jobId` 冪等・結果ZIP化がそのまま効きます。
+
+---
+
+# 非同期APIにしたい場合（長時間ジョブ向け）
+
+* `POST /submit` → **202 + jobId**（すぐ返す）
+* `GET /status/{jobId}` → `queued|running|done|failed`
+* `GET /result/{jobId}` → `200 ZIP` or `404`（未完）
+
+状態は **Redis/SQL** に `jobId` 行で持ち、Parent/Leader/Node が更新。
+（シンプル実装なら Parent だけが書き、Leader/Node はコールバックでParentを更新）
+
+---
+
+# 運用の要点
+
+* **障害訓練**：Leader落ち → フォロワー昇格、Node落ち → 他ノードで再実行、Group丸ごと落ち → 他Groupへ。
+* **クォータ**：グループ/ノードごとの同時実行上限で暴走を防止。
+* **局所性**：データ入力元に近いグループを優先（帯域節約）。
+* **クリーンアップ**：`done` からX日後にジョブディレクトリ削除、`running` の古いロックは期限切れ扱い。
+* **セキュリティ**：mTLS or APIキー、グループ間のFW閉域。
+
+---
+
+必要なら、この構成の**docker-compose（親・リーダー・ノードの3サービス）**や、**Redisリースでのリーダー選出コード**もまとめて出せます。どの段階（段階1～3）から入れますか？

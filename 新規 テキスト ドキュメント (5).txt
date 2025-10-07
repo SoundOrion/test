@@ -1,0 +1,557 @@
+いいね、**素のTCP（TcpListener）版**と、**Kestrel + ConnectionHandler**で“生TCPをKestrelにしゃべらせる”版の**最小実装**を並べます。どちらも「jobIdで冪等」「同時実行スロット」「バックプレッシャ」「結果はZIP返却」の骨子は共通です。
+（.NET 8 / Windows想定。`C:\pricer\pricer.exe` と `C:\cache\jobs\<jobId>\` を使用）
+
+---
+
+# 1) 素の TCP 実装（TcpListener）
+
+## 簡易プロトコル
+
+* クライアント→サーバー：
+  `JOB <jobId> <fileName> <contentLength>\n` の後に **バイナリ本文**（contentLengthバイト）
+* サーバー→クライアント：
+
+  * 空きスロット無し：`BUSY retry=5\n`
+  * 受理＆実行成功：`OK <resultLength>\n` の後に **ZIPバイナリ**
+  * 失敗：`ERR <message>\n`
+
+> 改行は `\n` 固定。header部はUTF-8。`fileName` はURLエンコード推奨（ここでは簡略）。
+
+## Node（TCPサーバー）
+
+```csharp
+// TcpNode/Program.cs
+using System.Net;
+using System.Text;
+using System.Diagnostics;
+using System.IO.Compression;
+
+string PricerExe = @"C:\pricer\pricer.exe";
+string CacheRoot = @"C:\cache\jobs";
+Directory.CreateDirectory(CacheRoot);
+
+int MaxParallel = Environment.ProcessorCount;
+var slots = new SemaphoreSlim(MaxParallel);
+static int _running = 0;
+
+var listener = new TcpListener(IPAddress.Any, 9099);
+listener.Start();
+Console.WriteLine("TCP Node listening on :9099");
+
+while (true)
+{
+    var client = await listener.AcceptTcpClientAsync();
+    _ = Task.Run(() => HandleClientAsync(client));
+}
+
+async Task HandleClientAsync(TcpClient client)
+{
+    using var c = client;
+    c.NoDelay = true;
+    using var ns = c.GetStream();
+    try
+    {
+        // 1) ヘッダ行を読む
+        var header = await ReadLineAsync(ns, 64 * 1024);
+        // 例: JOB <jobId> <fileName> <contentLength>
+        if (header is null || !header.StartsWith("JOB ")) { await WriteErr(ns, "bad header"); return; }
+        var parts = header.Split(' ', 4, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 4) { await WriteErr(ns, "bad header fields"); return; }
+        var jobId = parts[1];
+        var fileName = parts[2];
+        if (!long.TryParse(parts[3], out var contentLen) || contentLen < 0) { await WriteErr(ns, "bad length"); return; }
+
+        // 2) ジョブディレクトリと冪等チェック
+        var jobDir = Path.Combine(CacheRoot, jobId);
+        Directory.CreateDirectory(jobDir);
+        var resultZip = Path.Combine(jobDir, "result.zip");
+        var doneMarker = Path.Combine(jobDir, ".done");
+
+        if (File.Exists(doneMarker) && File.Exists(resultZip))
+        {
+            // 既処理 → すぐ返す
+            await SendZip(ns, resultZip);
+            return;
+        }
+
+        // 3) スロット確認（空きがなければBUSY）
+        if (!await slots.WaitAsync(0))
+        {
+            await WriteBusy(ns, retrySeconds: 5);
+            return;
+        }
+        Interlocked.Increment(ref _running);
+
+        try
+        {
+            // 4) 入力受信（ストリーミング）
+            var inputPath = Path.Combine(jobDir, fileName);
+            using (var fs = new FileStream(inputPath, new FileStreamOptions {
+                Mode = FileMode.Create, Access = FileAccess.Write,
+                Options = FileOptions.Asynchronous | FileOptions.SequentialScan
+            }))
+            {
+                await CopyFixedAsync(ns, fs, contentLen);
+            }
+
+            // 5) pricer.exe 実行（タイムアウト付き）
+            var (exitCode, stdout, stderr) = await RunPricerAsync(inputPath, Path.GetDirectoryName(PricerExe)!, TimeSpan.FromMinutes(15));
+
+            // 6) 結果ZIP（入力以外をまとめ、ログも含める）
+            if (File.Exists(resultZip)) File.Delete(resultZip);
+            using (var zip = ZipFile.Open(resultZip, ZipArchiveMode.Create))
+            {
+                // 入力以外の生成物を同梱
+                foreach (var file in Directory.EnumerateFiles(jobDir))
+                {
+                    if (string.Equals(file, inputPath, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (Path.GetFileName(file).StartsWith(".")) continue;
+                    zip.CreateEntryFromFile(file, Path.GetFileName(file), CompressionLevel.Optimal);
+                }
+                // ログ
+                File.WriteAllText(Path.Combine(jobDir, "stdout.txt"), stdout);
+                File.WriteAllText(Path.Combine(jobDir, "stderr.txt"), stderr);
+                zip.CreateEntryFromFile(Path.Combine(jobDir, "stdout.txt"), "stdout.txt");
+                zip.CreateEntryFromFile(Path.Combine(jobDir, "stderr.txt"), "stderr.txt");
+            }
+            if (exitCode == 0) File.WriteAllText(doneMarker, "ok");
+
+            // 7) 返却
+            if (exitCode != 0)
+                await WriteErr(ns, $"exit={exitCode}");
+            else
+                await SendZip(ns, resultZip);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _running);
+            slots.Release();
+        }
+    }
+    catch (Exception ex)
+    {
+        try { await WriteErr(ns, ex.Message); } catch { }
+    }
+}
+
+// ---- helpers ----
+static async Task<string?> ReadLineAsync(NetworkStream ns, int maxBytes)
+{
+    var ms = new MemoryStream();
+    var buf = new byte[1];
+    while (ms.Length < maxBytes)
+    {
+        int n = await ns.ReadAsync(buf, 0, 1);
+        if (n == 0) return null;
+        if (buf[0] == (byte)'\n') break;
+        ms.WriteByte(buf[0]);
+    }
+    return Encoding.UTF8.GetString(ms.ToArray()).TrimEnd('\r');
+}
+static async Task CopyFixedAsync(Stream src, Stream dst, long len)
+{
+    var buf = new byte[128 * 1024];
+    long rem = len;
+    while (rem > 0)
+    {
+        int want = (int)Math.Min(buf.Length, rem);
+        int n = await src.ReadAsync(buf.AsMemory(0, want));
+        if (n <= 0) throw new IOException("unexpected EOF");
+        await dst.WriteAsync(buf.AsMemory(0, n));
+        rem -= n;
+    }
+}
+static async Task<(int code,string stdout,string stderr)> RunPricerAsync(string inputPath, string workdir, TimeSpan timeout)
+{
+    var psi = new ProcessStartInfo {
+        FileName = Path.Combine(workdir, "pricer.exe"),
+        Arguments = $"\"{inputPath}\"",
+        WorkingDirectory = workdir,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        UseShellExecute = false,
+        CreateNoWindow = true
+    };
+    using var p = Process.Start(psi)!;
+    using var cts = new CancellationTokenSource(timeout);
+    var tOut = p.StandardOutput.ReadToEndAsync();
+    var tErr = p.StandardError.ReadToEndAsync();
+    var tWait = Task.Run(() => p.WaitForExit(), cts.Token);
+    try { await tWait; } catch { try { p.Kill(true); } catch { } }
+    return (p.HasExited ? p.ExitCode : -1, await tOut, await tErr);
+}
+static async Task WriteBusy(NetworkStream ns, int retrySeconds)
+{
+    var line = $"BUSY retry={retrySeconds}\n";
+    var bytes = Encoding.UTF8.GetBytes(line);
+    await ns.WriteAsync(bytes);
+}
+static async Task WriteErr(NetworkStream ns, string msg)
+{
+    var line = $"ERR {msg}\n";
+    await ns.WriteAsync(Encoding.UTF8.GetBytes(line));
+}
+static async Task SendZip(NetworkStream ns, string path)
+{
+    var fi = new FileInfo(path);
+    var head = $"OK {fi.Length}\n";
+    await ns.WriteAsync(Encoding.UTF8.GetBytes(head));
+    using var fs = File.OpenRead(path);
+    await fs.CopyToAsync(ns);
+}
+```
+
+## TCPクライアント（投入側）
+
+```csharp
+// TcpClient/Program.cs
+using System.Net.Sockets;
+using System.Text;
+
+string host = "node01"; int port = 9099;
+string jobId = Guid.NewGuid().ToString("N");
+string filePath = args.Length > 0 ? args[0] : "input.csv";
+var fileName = Path.GetFileName(filePath);
+
+using var tcp = new TcpClient();
+await tcp.ConnectAsync(host, port);
+using var ns = tcp.GetStream();
+
+var fi = new FileInfo(filePath);
+var header = $"JOB {jobId} {fileName} {fi.Length}\n";
+await ns.WriteAsync(Encoding.UTF8.GetBytes(header));
+using (var fs = File.OpenRead(filePath)) { await fs.CopyToAsync(ns); }
+
+// レスポンス
+string resp = await ReadLineAsync(ns);
+if (resp.StartsWith("BUSY"))
+{
+    Console.WriteLine(resp);
+    return;
+}
+if (resp.StartsWith("ERR"))
+{
+    Console.WriteLine(resp);
+    return;
+}
+var parts = resp.Split(' ', 2);
+if (parts[0] == "OK" && long.TryParse(parts[1], out var len))
+{
+    var save = Path.ChangeExtension(filePath, $".result.zip");
+    using var fs = File.Create(save);
+    await CopyFixedAsync(ns, fs, len);
+    Console.WriteLine($"saved: {save}");
+}
+
+// helpers（上のサーバと同様）
+static async Task<string> ReadLineAsync(NetworkStream ns)
+{
+    var ms = new MemoryStream();
+    var buf = new byte[1];
+    while (true)
+    {
+        int n = await ns.ReadAsync(buf, 0, 1);
+        if (n == 0) break;
+        if (buf[0] == (byte)'\n') break;
+        ms.WriteByte(buf[0]);
+    }
+    return Encoding.UTF8.GetString(ms.ToArray()).TrimEnd('\r');
+}
+static async Task CopyFixedAsync(Stream src, Stream dst, long len)
+{
+    var buf = new byte[128 * 1024];
+    long rem = len;
+    while (rem > 0)
+    {
+        int want = (int)Math.Min(buf.Length, rem);
+        int n = await src.ReadAsync(buf.AsMemory(0, want));
+        if (n <= 0) throw new IOException("unexpected EOF");
+        await dst.WriteAsync(buf.AsMemory(0, n));
+        rem -= n;
+    }
+}
+```
+
+> TLSが必要なら `SslStream` を使ってヘッダ→本文の順に同じフレーミングで流せます（社内CAのサーバー証明書でOK）。
+
+---
+
+# 2) **Kestrel + ConnectionHandler** 版（Kestrelで“生TCP”を処理）
+
+* Kestrel は HTTP だけでなく**任意の生TCPエンドポイント**をハンドル可能。
+* ついでに同プロセスに**HTTPの `/capacity`** も公開できるので、親/リーダとの連携が簡単。
+
+## プロジェクト構成
+
+```
+KestrelNode/
+  Program.cs        // Kestrelの起動 & エンドポイント設定
+  JobTcpHandler.cs  // ConnectionHandler: 生TCP処理（上のプロトコル）
+```
+
+## Program.cs
+
+```csharp
+// KestrelNode/Program.cs
+using Microsoft.AspNetCore.Connections;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
+using System.Net;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// capacity 用 HTTP
+int MaxParallel = Environment.ProcessorCount;
+var state = new NodeState(MaxParallel);
+
+// Kestrelエンドポイント設定
+builder.WebHost.ConfigureKestrel(k =>
+{
+    // 生TCP (9099) を ConnectionHandler に割り当て
+    k.Listen(IPAddress.Any, 9099, lo =>
+    {
+        lo.UseConnectionHandler<JobTcpHandler>(); // 下で定義
+        // lo.UseHttps(...) で mTLS も可（証明書設定）
+    });
+
+    // HTTP (5080) は通常のエンドポイント
+    k.Listen(IPAddress.Any, 5080);
+});
+
+builder.Services.AddSingleton(state);
+builder.Services.AddSingleton<JobTcpHandler>(); // DI
+builder.Services.AddSingleton(new JobRuntimeConfig(
+    pricerExe: @"C:\pricer\pricer.exe",
+    cacheRoot: @"C:\cache\jobs",
+    timeout: TimeSpan.FromMinutes(15)
+));
+
+var app = builder.Build();
+
+// HTTP: /capacity
+app.MapGet("/capacity", (NodeState s) => Results.Json(new { running = s.Running, limit = s.Limit }));
+
+app.Run();
+
+// --- NodeState（同時実行スロット管理）---
+class NodeState
+{
+    public readonly SemaphoreSlim Slots;
+    public int Limit { get; }
+    private int _running;
+    public int Running => _running;
+    public NodeState(int max) { Limit = max; Slots = new(max); }
+    public void Inc() => Interlocked.Increment(ref _running);
+    public void Dec() => Interlocked.Decrement(ref _running);
+}
+record JobRuntimeConfig(string pricerExe, string cacheRoot, TimeSpan timeout);
+```
+
+## JobTcpHandler.cs
+
+```csharp
+// KestrelNode/JobTcpHandler.cs
+using Microsoft.AspNetCore.Connections;
+using System.Text;
+using System.Diagnostics;
+using System.IO.Compression;
+
+public class JobTcpHandler : ConnectionHandler
+{
+    private readonly NodeState _state;
+    private readonly JobRuntimeConfig _cfg;
+
+    public JobTcpHandler(NodeState state, JobRuntimeConfig cfg)
+    {
+        _state = state; _cfg = cfg;
+        Directory.CreateDirectory(_cfg.cacheRoot);
+    }
+
+    public override async Task OnConnectedAsync(ConnectionContext ctx)
+    {
+        var s = ctx.Transport; // 生バイトの読み書きができる
+        try
+        {
+            // 1) ヘッダ行
+            var header = await ReadLineAsync(s);
+            if (header is null || !header.StartsWith("JOB ")) { await WriteErr(s, "bad header"); return; }
+            var parts = header.Split(' ', 4, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length != 4) { await WriteErr(s, "bad fields"); return; }
+            var jobId = parts[1];
+            var fileName = parts[2];
+            if (!long.TryParse(parts[3], out var contentLen) || contentLen < 0) { await WriteErr(s, "bad length"); return; }
+
+            var jobDir = Path.Combine(_cfg.cacheRoot, jobId);
+            Directory.CreateDirectory(jobDir);
+            var resultZip = Path.Combine(jobDir, "result.zip");
+            var done = Path.Combine(jobDir, ".done");
+
+            if (File.Exists(done) && File.Exists(resultZip))
+            {
+                await SendZip(s, resultZip);
+                return;
+            }
+
+            // スロット
+            if (!await _state.Slots.WaitAsync(0))
+            {
+                await WriteBusy(s, 5);
+                return;
+            }
+            _state.Inc();
+            try
+            {
+                var inputPath = Path.Combine(jobDir, fileName);
+                using (var fs = new FileStream(inputPath, new FileStreamOptions {
+                    Mode = FileMode.Create, Access = FileAccess.Write,
+                    Options = FileOptions.Asynchronous | FileOptions.SequentialScan
+                }))
+                {
+                    await CopyFixedAsync(s, fs, contentLen);
+                }
+
+                var (exitCode, stdout, stderr) = await RunPricerAsync(_cfg.pricerExe, inputPath, _cfg.timeout);
+
+                if (File.Exists(resultZip)) File.Delete(resultZip);
+                using (var zip = ZipFile.Open(resultZip, ZipArchiveMode.Create))
+                {
+                    foreach (var f in Directory.EnumerateFiles(jobDir))
+                    {
+                        if (string.Equals(f, inputPath, StringComparison.OrdinalIgnoreCase)) continue;
+                        if (Path.GetFileName(f).StartsWith(".")) continue;
+                        zip.CreateEntryFromFile(f, Path.GetFileName(f), CompressionLevel.Optimal);
+                    }
+                    File.WriteAllText(Path.Combine(jobDir, "stdout.txt"), stdout);
+                    File.WriteAllText(Path.Combine(jobDir, "stderr.txt"), stderr);
+                    zip.CreateEntryFromFile(Path.Combine(jobDir, "stdout.txt"), "stdout.txt");
+                    zip.CreateEntryFromFile(Path.Combine(jobDir, "stderr.txt"), "stderr.txt");
+                }
+                if (exitCode == 0) File.WriteAllText(done, "ok");
+
+                if (exitCode != 0) await WriteErr(s, $"exit={exitCode}");
+                else await SendZip(s, resultZip);
+            }
+            finally
+            {
+                _state.Dec();
+                _state.Slots.Release();
+            }
+        }
+        catch (Exception ex)
+        {
+            try { await WriteErr(ctx.Transport, ex.Message); } catch { }
+        }
+    }
+
+    // ---- raw helpers (PipeReader/Writer friendly) ----
+    private static async Task<string?> ReadLineAsync(IDuplexPipe t, int max = 64*1024)
+    {
+        var sb = new StringBuilder();
+        var buf = new byte[1];
+        int count = 0;
+        while (count < max)
+        {
+            var res = await t.Input.ReadAsync();
+            var seq = res.Buffer;
+            if (seq.IsEmpty && res.IsCompleted) break;
+
+            var reader = new SequenceReader<byte>(seq);
+            while (reader.TryRead(out var b))
+            {
+                count++;
+                if (b == (byte)'\n')
+                {
+                    t.Input.AdvanceTo(reader.Position);
+                    return sb.ToString().TrimEnd('\r');
+                }
+                sb.Append((char)b);
+                if (count >= max) break;
+            }
+            t.Input.AdvanceTo(reader.Position, seq.End);
+        }
+        return null;
+    }
+
+    private static async Task CopyFixedAsync(IDuplexPipe t, Stream dst, long len)
+    {
+        long rem = len;
+        while (rem > 0)
+        {
+            var r = await t.Input.ReadAsync();
+            var buf = r.Buffer;
+            if (buf.Length == 0 && r.IsCompleted) throw new IOException("unexpected EOF");
+
+            var toCopy = (long)Math.Min(buf.Length, rem);
+            var seq = buf.Slice(0, toCopy);
+            foreach (var m in seq)
+                await dst.WriteAsync(m);
+
+            rem -= toCopy;
+            t.Input.AdvanceTo(seq.End, buf.End);
+        }
+    }
+
+    private static async Task SendZip(IDuplexPipe t, string path)
+    {
+        var fi = new FileInfo(path);
+        var head = $"OK {fi.Length}\n";
+        await t.Output.WriteAsync(Encoding.UTF8.GetBytes(head));
+        await t.Output.FlushAsync();
+
+        using var fs = File.OpenRead(path);
+        var buf = new byte[128 * 1024];
+        int n;
+        while ((n = await fs.ReadAsync(buf)) > 0)
+        {
+            await t.Output.WriteAsync(new ReadOnlyMemory<byte>(buf, 0, n));
+        }
+        await t.Output.FlushAsync();
+    }
+    private static async Task WriteBusy(IDuplexPipe t, int retry)
+    {
+        await t.Output.WriteAsync(Encoding.UTF8.GetBytes($"BUSY retry={retry}\n"));
+        await t.Output.FlushAsync();
+    }
+    private static async Task WriteErr(IDuplexPipe t, string msg)
+    {
+        await t.Output.WriteAsync(Encoding.UTF8.GetBytes($"ERR {msg}\n"));
+        await t.Output.FlushAsync();
+    }
+
+    private static async Task<(int code,string stdout,string stderr)> RunPricerAsync(string exe, string inputPath, TimeSpan timeout)
+    {
+        var psi = new ProcessStartInfo {
+            FileName = exe, Arguments = $"\"{inputPath}\"",
+            WorkingDirectory = Path.GetDirectoryName(exe)!,
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            UseShellExecute = false, CreateNoWindow = true
+        };
+        using var p = Process.Start(psi)!;
+        using var cts = new CancellationTokenSource(timeout);
+        var tOut = p.StandardOutput.ReadToEndAsync();
+        var tErr = p.StandardError.ReadToEndAsync();
+        var tWait = Task.Run(() => p.WaitForExit(), cts.Token);
+        try { await tWait; } catch { try { p.Kill(true); } catch { } }
+        return (p.HasExited ? p.ExitCode : -1, await tOut, await tErr);
+    }
+}
+```
+
+> これで **:9099（生TCP）** と **:5080（HTTP `/capacity`）** を同居させられます。Kestrelの利点は、将来**HTTP/2やgRPCにも同一プロセスで拡張**しやすいこと、**mTLS** を `UseHttps` で簡単に組み込めること。
+
+---
+
+## 運用メモ（両方式共通）
+
+* **同時実行**：`SemaphoreSlim` で実行スロット、別に**受信スロット**も設けると洪水に強い。
+* **冪等**：`jobId` 固定＋`result.zip`＋`.done` マーカー。
+* **フェイルオーバー**：BUSY/接続失敗/ERR 時は**親/リーダ**が別ノードへ再送。
+* **TLS**：
+
+  * 素TCP：`SslStream`。
+  * Kestrel：`UseHttps`（サーバー証明書）＋**クライアント証明書必須**でmTLS。
+* **監視**：`/capacity` をPrometheusでスクレイプ、BUSY率・ExitCode分布・処理時間ヒストグラム。
+* **クリーンアップ**：`jobs/<jobId>` は完了後X日で削除。`running`の残骸はTTLで廃棄。
+
+---
+
+必要なら、**親（Coordinator）とグループリーダ**の“TCP連携版”（BUSYやERRに応じてノードを切り替えるコード）や、**mTLS設定例**もまとめて出します。どっちの方式（素のTCP / Kestrel版）で進めます？
