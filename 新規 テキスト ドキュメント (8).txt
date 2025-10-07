@@ -1,0 +1,83 @@
+もちろん、PowerShell スクリプトはデバッグできます 👍
+
+やり方はいくつかあります。目的に応じて選んでください。
+
+---
+
+### 🧩 1. `Set-PSDebug` コマンドを使う（標準のステップ実行）
+
+PowerShellには「スクリプトを逐次実行してトレースする」機能が標準であります。
+
+```powershell
+Set-PSDebug -Trace 1   # 実行内容を出力
+Set-PSDebug -Trace 2   # コマンドごとの詳細（引数展開など）も出力
+Set-PSDebug -Step      # 1行ずつ実行確認しながら進める
+```
+
+終了するには：
+
+```powershell
+Set-PSDebug -Off
+```
+
+---
+
+### 🧠 2. VS Code + PowerShell 拡張でデバッグ
+
+最も便利なのは Visual Studio Code に [PowerShell 拡張機能](https://marketplace.visualstudio.com/items?itemName=ms-vscode.PowerShell) を入れてデバッグする方法です。
+
+**できること：**
+
+* ブレークポイント（停止ポイント）設定
+* 変数の中身を確認
+* ステップ実行（F10 / F11）
+* Watchウィンドウや呼び出しスタックの確認
+
+**手順：**
+
+1. VS Codeを開く
+2. 拡張機能から「PowerShell」をインストール
+3. `.ps1` ファイルを開く
+4. 左の行番号の左をクリックしてブレークポイント設定
+5. F5（またはデバッグパネル▶）で開始
+
+---
+
+### 🪶 3. 手動デバッグ用のトレース出力
+
+簡単に確認したい場合はスクリプト内にログ出力を挟みます。
+
+```powershell
+Write-Host "変数xの中身: $x"
+Write-Debug "詳細ログ: $x"  # -Debug スイッチを指定して実行すると表示される
+```
+
+`Write-Debug` は通常非表示ですが、スクリプトを実行するときに：
+
+```powershell
+.\test.ps1 -Debug
+```
+
+とすれば出力されます。
+
+---
+
+### 🧰 4. 例外を補足して詳細を確認する
+
+Try/Catchを使えば、エラーの詳細を出して原因追跡できます。
+
+```powershell
+try {
+    Get-Item "C:\NotExist.txt"
+}
+catch {
+    Write-Host "エラー発生: $($_.Exception.Message)"
+}
+```
+
+---
+
+もしよければ、あなたの書いた PowerShell スクリプトを貼ってくれたら、
+具体的に「どこをどうデバッグすればいいか」も一緒に説明できます。
+
+貼りますか？
