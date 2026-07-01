@@ -1,0 +1,14 @@
+controller:
+  service:
+    type: NodePort
+
+  image:
+    pullPolicy: IfNotPresent
+    digest: ""
+    digestChroot: ""
+
+  admissionWebhooks:
+    patch:
+      image:
+        pullPolicy: IfNotPresent
+        digest: ""
