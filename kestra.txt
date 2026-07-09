@@ -1,0 +1,70 @@
+たぶん **minikube で Kestra を起動した**状態ですね。これはざっくり言うと、**YAMLでワークフローを書いて、実行・スケジュール・ログ確認するツール**です。今の Dashboard が全部 0 なのは、まだ Flow を実行してないだけなので正常です。
+
+まず触る場所は **Dashboard ではなく左メニューの「Flows」** です。Kestra では **Flow = ワークフロー本体**で、`id`、`namespace`、`tasks` を持つYAMLとして定義します。([Kestra][1])
+
+### まず Hello World を作る
+
+左の **Flows** → **Create Flow**、または右上の **+ Create Flow** から、これを貼って保存してください。
+
+```yaml
+id: hello_world
+namespace: dev
+
+tasks:
+  - id: hello
+    type: io.kestra.plugin.core.log.Log
+    message: "Hello from Kestra on minikube 👋"
+```
+
+保存したら **Execute** を押します。実行結果は **Executions** で確認でき、ログはその実行画面か左メニューの **Logs** で見られます。Kestra UIでは、Flowsで作成・編集・実行、Executionsで過去実行の確認、Logsでタスクログ確認、Blueprintsでサンプル参照ができます。([Kestra][2])
+
+### 入力付きの Flow 例
+
+実行時に値を入れたいなら、こうします。
+
+```yaml
+id: hello_input
+namespace: dev
+
+inputs:
+  - id: name
+    type: STRING
+    defaults: "taro"
+
+tasks:
+  - id: hello
+    type: io.kestra.plugin.core.log.Log
+    message: "こんにちは {{ inputs.name }}"
+```
+
+実行時にフォームが出て、`name` を変えられます。Kestra の Inputs は `id` と `type` を持ち、必要なら `defaults` を設定できます。([Kestra][3])
+
+### 画面の見方
+
+| メニュー           | 使う場面                 |
+| -------------- | -------------------- |
+| **Dashboards** | 実行数、失敗率などの全体確認       |
+| **Flows**      | ワークフロー作成・編集・実行       |
+| **Executions** | 1回ごとの実行結果を見る         |
+| **Logs**       | エラー原因や出力を見る          |
+| **Blueprints** | サンプルFlowを探す          |
+| **Namespaces** | プロジェクト/環境ごとにFlowを分ける |
+
+`Apps` や `Tenant` など鍵マークが付いているものは、最初は無視で大丈夫です。まずは **Flows → 作る → Execute → Logsを見る** の流れだけ覚えればOKです。
+
+### ターミナルから実行するなら
+
+ローカルの `localhost:8080` に出ているなら、APIでも実行できます。
+
+```bash
+curl -X POST http://localhost:8080/api/v1/main/executions/dev/hello_world
+```
+
+Kestra は `/api/v1/main/executions/{namespace}/{flowId}` にPOSTしてFlowを実行でき、入力値もフォームデータで渡せます。([Kestra][4])
+
+minikube で動かしているなら、まずは **Blueprints からサンプルを1つコピーして動かす**のが一番早いです。そこからログ確認、失敗させてみる、入力を足す、定期実行を足す、の順で慣れるのがよさげです。
+
+[1]: https://kestra.io/docs/workflow-components/flow?utm_source=chatgpt.com "Flows in Kestra – Define Orchestration Units"
+[2]: https://kestra.io/docs/ui?utm_source=chatgpt.com "Kestra UI & No Code: Dashboards, Flows & Logs"
+[3]: https://kestra.io/docs/tutorial/inputs?utm_source=chatgpt.com "Add Inputs to Kestra Workflows"
+[4]: https://kestra.io/docs/workflow-components/execution?utm_source=chatgpt.com "Trigger, Monitor, and Troubleshoot Flow Executions"
