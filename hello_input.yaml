@@ -1,0 +1,12 @@
+id: hello_input
+namespace: dev
+
+inputs:
+  - id: name
+    type: STRING
+    defaults: "taro"
+
+tasks:
+  - id: hello
+    type: io.kestra.plugin.core.log.Log
+    message: "こんにちは {{ inputs.name }}"
